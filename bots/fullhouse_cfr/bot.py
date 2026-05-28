@@ -3,8 +3,9 @@ Fullhouse Hackathon bot — PHASE 1 BASELINE (heuristic / equity).
 
 Strategy in one breath:
   - Preflop: Chen-formula hand scoring + position + facing-a-raise logic.
-  - Postflop: Monte-Carlo equity (eval7) vs. live opponents, compared to the
-    pot-odds price. Value-bet when ahead, call when priced in, fold otherwise.
+  - Postflop: Monte-Carlo equity (eval7) vs. live opponents vs. a pot-odds
+    price, with a range penalty when facing bets (softened vs. proven-aggressive
+    opponents, waived for strong draws) plus draw-based semi-bluffing.
 
 This is the SAFE qualifier bot: it never crashes (wrapped in try/except),
 stays far under the 2s budget (bounded MC), and uses no forbidden imports.
@@ -160,6 +161,84 @@ def _lateness(state):
 
 
 # ---------------------------------------------------------------------------
+# Opponent modeling (uses the cross-hand match_action_log injected by the engine)
+# ---------------------------------------------------------------------------
+
+def _current_aggressor_bot_id(state):
+    """bot_id of the player whose bet we're facing (the last raise/all_in)."""
+    seat = None
+    for a in state.get("action_log", []):
+        if a.get("action") in ("raise", "all_in"):
+            seat = a.get("seat")
+    if seat is None:
+        return None
+    for p in state["players"]:
+        if p["seat"] == seat:
+            return p.get("bot_id")
+    return None
+
+
+def _aggression_factor(state, bot_id):
+    """Fraction of a player's voluntary actions that were bets/raises, taken
+    from the cross-hand match_action_log. None if we lack enough samples."""
+    if not bot_id:
+        return None
+    aggressive = passive = 0
+    for e in state.get("match_action_log", []):
+        if e.get("bot_id") != bot_id:
+            continue
+        a = e.get("action")
+        if a in ("raise", "all_in"):
+            aggressive += 1
+        elif a in ("call", "check"):
+            passive += 1
+    total = aggressive + passive
+    if total < 8:
+        return None
+    return aggressive / total
+
+
+def _penalty_multiplier(state):
+    """Scale the facing-a-bet range penalty by the current bettor's aggression.
+    Maniacs (high AF) bet light -> smaller penalty (call wider); nits -> larger."""
+    af = _aggression_factor(state, _current_aggressor_bot_id(state))
+    if af is None:
+        return 1.0
+    mult = 1.0 - (af - 0.35) * 1.1            # AF ~0.35 is treated as neutral
+    return max(0.35, min(1.5, mult))
+
+
+def _draw_outs(hole_strs, board_strs):
+    """Rough out count for flush + straight draws. Used to recognise strong
+    draws, whose equity holds up even against a strong made-hand range."""
+    cards = hole_strs + board_strs
+    suit_counts = {}
+    for c in cards:
+        suit_counts[c[1]] = suit_counts.get(c[1], 0) + 1
+    flush_draw = any(v == 4 for v in suit_counts.values())
+
+    present = set(RANK_VAL[c[0]] for c in cards)
+    if 14 in present:
+        present.add(1)                        # ace plays low for the wheel
+    straight_ranks = 0
+    for r in range(1, 15):
+        if r in present:
+            continue
+        test = present | {r}
+        run = 0
+        for v in range(1, 15):
+            run = run + 1 if v in test else 0
+            if run >= 5:
+                straight_ranks += 1
+                break
+
+    outs = (9 if flush_draw else 0) + straight_ranks * 4
+    if flush_draw and straight_ranks:
+        outs -= 2                             # rough de-dup of shared cards
+    return outs
+
+
+# ---------------------------------------------------------------------------
 # Preflop decision
 # ---------------------------------------------------------------------------
 
@@ -213,30 +292,45 @@ def _postflop(state):
     iters = 250 if n_opp <= 2 else 140
     eq = equity(state["your_cards"], state["community_cards"], n_opp, iters)
 
+    street = state["street"]
     owed = state["amount_owed"]
     pot = state["pot"]
     can_check = state["can_check"]
 
+    strong_draw = (street in ("flop", "turn")
+                   and _draw_outs(state["your_cards"], state["community_cards"]) >= 8)
+
     if can_check:
-        # No bet to us: value-bet when ahead, otherwise take the free card.
+        # No bet to us.
         if eq >= 0.80:
-            return _bet(state, 0.75)
+            return _bet(state, 0.75)                 # big value
         if eq >= 0.62:
-            return _bet(state, 0.55)
+            return _bet(state, 0.55)                 # thin value
+        if strong_draw and random.random() < 0.45:
+            return _bet(state, 0.55)                 # semi-bluff with a real draw
         return {"action": "check"}
 
     # Facing a bet. equity() is measured vs. a RANDOM hand, but a player who
     # bets — especially big, on a late street — has a range much stronger than
     # random. Calling on raw equity-vs-random therefore over-calls (e.g. bottom
-    # pair vs. a pot-sized river bet). So we lift the equity bar we need to
-    # call, scaled by the bet size (relative to pot) and the street (ranges get
-    # more defined street by street, and the river has no cards left to draw).
+    # pair vs. a pot-sized river bet). So we lift the equity bar we need to call:
+    #   * scaled by bet size (relative to pot) and street,
+    #   * softened vs. proven-aggressive opponents / hardened vs. nits, and
+    #   * largely waived when WE hold a strong draw (drawing equity holds up
+    #     even against a strong made-hand range).
     required = owed / (pot + owed) if (pot + owed) > 0 else 1.0
     if eq >= 0.82:
-        return _reraise(state, 0.9)                 # strong enough to raise for value
-    street_factor = {"flop": 0.16, "turn": 0.24, "river": 0.30}.get(state["street"], 0.24)
+        return _reraise(state, 0.9)                  # strong enough to raise for value
+
+    if strong_draw and eq >= 0.42 and random.random() < 0.30:
+        return _reraise(state, 0.8)                  # semi-bluff raise
+
+    street_factor = {"flop": 0.16, "turn": 0.24, "river": 0.30}.get(street, 0.24)
     bet_frac = owed / pot if pot > 0 else 1.0        # call size vs. the current pot
     range_penalty = street_factor * min(bet_frac / 0.6, 1.2)
+    range_penalty *= _penalty_multiplier(state)
+    if strong_draw:
+        range_penalty *= 0.25
     bar = required + 0.03 + range_penalty
     if eq >= bar:
         return {"action": "call"}
