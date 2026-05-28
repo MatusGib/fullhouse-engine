@@ -225,11 +225,20 @@ def _postflop(state):
             return _bet(state, 0.55)
         return {"action": "check"}
 
-    # Facing a bet: compare equity to the price we're getting.
+    # Facing a bet. equity() is measured vs. a RANDOM hand, but a player who
+    # bets — especially big, on a late street — has a range much stronger than
+    # random. Calling on raw equity-vs-random therefore over-calls (e.g. bottom
+    # pair vs. a pot-sized river bet). So we lift the equity bar we need to
+    # call, scaled by the bet size (relative to pot) and the street (ranges get
+    # more defined street by street, and the river has no cards left to draw).
     required = owed / (pot + owed) if (pot + owed) > 0 else 1.0
     if eq >= 0.82:
-        return _reraise(state, 0.9)         # raise for value
-    if eq >= required + 0.04:               # priced in with a margin
+        return _reraise(state, 0.9)                 # strong enough to raise for value
+    street_factor = {"flop": 0.16, "turn": 0.24, "river": 0.30}.get(state["street"], 0.24)
+    bet_frac = owed / pot if pot > 0 else 1.0        # call size vs. the current pot
+    range_penalty = street_factor * min(bet_frac / 0.6, 1.2)
+    bar = required + 0.03 + range_penalty
+    if eq >= bar:
         return {"action": "call"}
     return {"action": "fold"}
 
