@@ -1,21 +1,27 @@
 """
-Fullhouse Hackathon bot — PHASE 1 BASELINE (heuristic / equity).
+Fullhouse Hackathon bot — strong heuristic core, with a heads-up CFR blueprint
+wired in but currently DISABLED.
 
-Strategy in one breath:
-  - Preflop: Chen-formula hand scoring + position + facing-a-raise logic.
-  - Postflop: Monte-Carlo equity (eval7) vs. live opponents vs. a pot-odds
-    price, with a range penalty when facing bets (softened vs. proven-aggressive
-    opponents, waived for strong draws) plus draw-based semi-bluffing.
+  - HEURISTIC (active): Chen-formula preflop + eval7 Monte-Carlo equity vs. a
+    pot-odds price, a range penalty vs. bets, opponent-aggression reads from the
+    match log, and draw-based semi-bluffing. Beats every reference bot.
+  - CFR BLUEPRINT (BP_ENABLED = False): in true heads-up spots the bot can map
+    the live state into an abstracted infoset and play an MCCFR-trained strategy
+    from data/blueprint.npz (see training/). The v1 abstraction trains to a
+    near-Nash that measured ~break-even vs. the heuristic in mirrored A/B tests,
+    so it ships off; flip BP_ENABLED once a richer abstraction wins in
+    training/eval_blueprint.py.
 
-This is the SAFE qualifier bot: it never crashes (wrapped in try/except),
-stays far under the 2s budget (bounded MC), and uses no forbidden imports.
-The CFR blueprint comes later and will slot in behind this same file, using
-the equity logic here as its off-tree fallback.
+Safety: any missing data or inconsistent lookup falls back to the heuristic, so
+the bot is never worse than the validated baseline. Never crashes (wrapped),
+stays far under the 2s budget, and uses no forbidden imports.
 """
 
+import os
 import random
 import math
 import eval7
+import numpy as np
 
 BOT_NAME = "FullHouseCFR"
 BOT_AVATAR = "robot_1"
@@ -32,6 +38,39 @@ CARD_STR = {str(c): c for c in FULL_DECK}     # "As" -> eval7.Card
 RANK_VAL = {r: i + 2 for i, r in enumerate(_RANKS)}   # "2"->2 ... "A"->14
 
 DEFAULT_BB = 100
+SB_CHIPS, BB_CHIPS = 50, 100      # engine blinds (must match engine/game.py)
+
+
+# ---------------------------------------------------------------------------
+# CFR blueprint — loaded once at import (the 30s warmup call absorbs it). If the
+# data files are missing or load fails, BLUEPRINT stays None and the bot plays
+# the pure heuristic below, so it is never worse than the validated baseline.
+# ---------------------------------------------------------------------------
+
+def _load_blueprint():
+    try:
+        data_dir = os.environ.get(
+            "BOT_DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
+        cz = np.load(os.path.join(data_dir, "abstraction.npz"))
+        centroids = {s: cz[s] for s in cz.files}
+        bz = np.load(os.path.join(data_dir, "blueprint.npz"))
+        index = {str(k): i for i, k in enumerate(bz["keys"])}
+        return {"centroids": centroids, "codes": bz["codes"], "probs": bz["probs"],
+                "visits": bz["visits"], "index": index}
+    except Exception:
+        return None
+
+
+BLUEPRINT = _load_blueprint()
+# Only trust a blueprint infoset that was visited enough to have converged.
+BP_MIN_VISITS = 50.0
+# Master switch. The v1 abstraction (8 buckets/street + a 3-size bet menu) trains
+# to a near-Nash that measured ~break-even-to-slightly-worse than the heuristic
+# in mirrored heads-up A/B tests (training/eval_blueprint.py) — the abstraction
+# ceiling, not undertraining. So we ship with the blueprint OFF and play the
+# stronger, proven heuristic. Flip to True once a richer abstraction (more
+# buckets, finer bet sizes) beats the heuristic in eval_blueprint.py.
+BP_ENABLED = False
 
 
 # ---------------------------------------------------------------------------
@@ -338,11 +377,190 @@ def _postflop(state):
 
 
 # ---------------------------------------------------------------------------
+# CFR blueprint lookup  (mirrors training/holdem_abstraction.py + holdem_train.py)
+# ---------------------------------------------------------------------------
+
+def _bp_preflop_index(hole):
+    i1, i2 = RANK_VAL[hole[0][0]] - 2, RANK_VAL[hole[1][0]] - 2   # 0..12
+    if i1 == i2:
+        return i1
+    hi, lo = max(i1, i2), min(i1, i2)
+    pid = hi * (hi - 1) // 2 + lo
+    return 13 + pid if (hole[0][1] == hole[1][1]) else 13 + 78 + pid
+
+
+def _bp_feature(hole, board, iters=200):
+    """(equity_to_river, made_strength_now) — identical formula to training."""
+    hole_c = [CARD_STR[c] for c in hole]
+    board_c = [CARD_STR[c] for c in board]
+    known = set(hole) | set(board)
+    deck = [c for c in FULL_DECK if str(c) not in known]
+    need = 5 - len(board)
+    my_now = eval7.evaluate(hole_c + board_c)
+    w_river = w_now = 0.0
+    for _ in range(iters):
+        s = random.sample(deck, 2 + need)
+        opp, run = s[:2], s[2:]
+        on = eval7.evaluate(opp + board_c)
+        if my_now > on:
+            w_now += 1
+        elif my_now == on:
+            w_now += 0.5
+        comm = board_c + run
+        mr, orr = eval7.evaluate(hole_c + comm), eval7.evaluate(opp + comm)
+        if mr > orr:
+            w_river += 1
+        elif mr == orr:
+            w_river += 0.5
+    return (w_river / iters, w_now / iters)
+
+
+def _bp_bucket(hole, board, street):
+    if street == "preflop":
+        return _bp_preflop_index(hole)
+    cents = BLUEPRINT["centroids"][street]
+    f = _bp_feature(hole, board)
+    d = ((cents - np.asarray(f, dtype=np.float64)) ** 2).sum(axis=1)
+    return int(np.argmin(d))
+
+
+_STREET_IDX = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
+
+
+def _bp_reconstruct_key(state):
+    """Replay the action log into the abstract infoset key used in training:
+    "street|bucket|history". Returns None if the log can't be mapped cleanly."""
+    log = state["action_log"]
+    sb = bb = None
+    for a in log:
+        if a["action"] == "small_blind":
+            sb = a["seat"]
+        elif a["action"] == "big_blind":
+            bb = a["seat"]
+    if sb is None or bb is None:
+        return None
+    seat2p = {sb: 0, bb: 1}
+
+    codes = []
+    sc = [SB_CHIPS, BB_CHIPS]       # street contributions, seeded with the blinds
+    acted = [False, False]
+    bet_seen = True                 # preflop has the standing big blind
+    for a in log:
+        act = a["action"]
+        if act in ("small_blind", "big_blind"):
+            continue
+        pl = seat2p.get(a["seat"])
+        if pl is None:
+            return None
+        amt = a.get("amount", 0) or 0
+        if act == "fold":
+            codes.append("f")
+            acted[pl] = True
+        elif act == "check":
+            codes.append("x")
+            acted[pl] = True
+        elif act == "call":
+            codes.append("c")
+            sc[pl] = max(sc)
+            acted[pl] = True
+        elif act == "raise":
+            codes.append("r" if bet_seen else "b")
+            sc[pl] = amt
+            acted[pl] = bet_seen = True
+        elif act == "all_in":
+            codes.append("a")
+            sc[pl] = amt if amt else max(sc)
+            acted[pl] = bet_seen = True
+        else:
+            return None
+        if act != "fold" and sc[0] == sc[1] and acted[0] and acted[1]:
+            codes.append("/")
+            sc = [0, 0]
+            acted = [False, False]
+            bet_seen = False
+
+    bucket = _bp_bucket(state["your_cards"], state["community_cards"], state["street"])
+    return "%d|%d|%s" % (_STREET_IDX[state["street"]], bucket, "".join(codes))
+
+
+def _bp_translate(state, code):
+    """Turn an abstract action code into a concrete, legal engine action."""
+    if code == "x":
+        return {"action": "check"} if state["can_check"] else {"action": "call"}
+    if code == "c":
+        return {"action": "check"} if state["can_check"] else {"action": "call"}
+    if code == "f":
+        return {"action": "fold"} if not state["can_check"] else {"action": "check"}
+    if code == "a":
+        return {"action": "all_in"}
+    if code == "b":
+        return _bet(state, 0.75)
+    if code == "r":
+        return _reraise(state, 1.0)
+    return None
+
+
+def _blueprint_action(state):
+    """Return a blueprint action for a true heads-up spot, or None to defer to
+    the heuristic."""
+    if not BP_ENABLED or BLUEPRINT is None:
+        return None
+    players = state["players"]
+    if len(players) != 2:                       # heads-up table only
+        return None
+    bb = _big_blind(state)
+    eff = min(p["stack"] + p["bet_this_street"] for p in players)
+    if eff < 40 * bb:                           # blueprint is ~100bb; skip short stacks
+        return None
+    me = state["seat_to_act"]
+    sb = bbs = None
+    for a in state["action_log"]:
+        if a["action"] == "small_blind":
+            sb = a["seat"]
+        elif a["action"] == "big_blind":
+            bbs = a["seat"]
+    if me not in (sb, bbs):
+        return None
+
+    key = _bp_reconstruct_key(state)
+    if key is None:
+        return None
+    idx = BLUEPRINT["index"].get(key)
+    if idx is None:
+        return None
+    if BLUEPRINT["visits"][idx] < BP_MIN_VISITS:   # only trust converged infosets
+        return None
+    codes = str(BLUEPRINT["codes"][idx])
+    # consistency guard: a facing-bet infoset starts with 'f', a no-bet one 'x'.
+    faces_bet = codes[:1] == "f"
+    if faces_bet == bool(state["can_check"]):
+        return None
+
+    probs = np.asarray(BLUEPRINT["probs"][idx][:len(codes)], dtype=np.float64)
+    tot = probs.sum()
+    if tot <= 0:
+        return None
+    probs /= tot
+    r = random.random()
+    cum = 0.0
+    pick = codes[-1]
+    for c, p in zip(codes, probs):
+        cum += p
+        if r <= cum:
+            pick = c
+            break
+    return _bp_translate(state, pick)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def decide(game_state: dict) -> dict:
     try:
+        action = _blueprint_action(game_state)   # heads-up CFR blueprint, if applicable
+        if action is not None:
+            return action
         if game_state.get("street") == "preflop":
             return _preflop(game_state)
         return _postflop(game_state)
