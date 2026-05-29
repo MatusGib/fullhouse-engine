@@ -252,6 +252,31 @@ def _penalty_multiplier(state):
     return max(0.35, min(1.5, mult))
 
 
+def _hu_opponent_bot_id(state):
+    """The single live opponent's bot_id (heads-up), for fold-tendency reads."""
+    me = state["seat_to_act"]
+    for p in state["players"]:
+        if p["seat"] != me and not p["is_folded"]:
+            return p.get("bot_id")
+    return None
+
+
+def _fold_factor(state, bot_id):
+    """Fraction of a player's actions that were folds (from the match log).
+    High = foldy (bluff more); low = calling station (don't bluff). None if scant."""
+    if not bot_id:
+        return None
+    folds = total = 0
+    for e in state.get("match_action_log", []):
+        if e.get("bot_id") != bot_id:
+            continue
+        if e.get("action") in ("fold", "call", "check", "raise", "all_in"):
+            total += 1
+            if e.get("action") == "fold":
+                folds += 1
+    return folds / total if total >= 8 else None
+
+
 def _draw_outs(hole_strs, board_strs):
     """Rough out count for flush + straight draws. Used to recognise strong
     draws, whose equity holds up even against a strong made-hand range."""
@@ -288,22 +313,25 @@ def _draw_outs(hole_strs, board_strs):
 
 def _preflop(state):
     bb = _big_blind(state)
-    chen = chen_score(state["your_cards"])
+    cards = state["your_cards"]
+    chen = chen_score(cards)
+    is_pair = cards[0][0] == cards[1][0]
     late = _lateness(state)
+    n_opp = _num_opponents(state)
     owed = state["amount_owed"]
     pot = state["pot"]
-    stack = state["your_stack"]
+    eff = state["your_stack"] + state["your_bet_this_street"]   # effective stack
     can_check = state["can_check"]
     current_bet = state["current_bet"]
     facing_raise = current_bet > bb
 
     # Short-stack push/fold: with <=10bb, raising small is a trap — jam or fold.
-    if stack <= 10 * bb and not can_check:
+    if eff <= 10 * bb and not can_check:
         return {"action": "all_in"} if chen >= 7 else {"action": "fold"}
 
     if not facing_raise:
-        # Open or take a free look.
-        open_thresh = 9 - 4 * late          # ~9 UTG, ~5 on the button
+        # Open or take a free look (open wider heads-up / short-handed).
+        open_thresh = 9 - 4 * late - (2 if n_opp <= 1 else 0)
         if chen >= open_thresh:
             target = 3 * bb
             if pot > 2 * bb:                # limpers in front -> size up
@@ -315,12 +343,14 @@ def _preflop(state):
             return {"action": "call"}
         return {"action": "fold"}
 
-    # Facing a raise: 3-bet premiums, flat strong, fold the rest.
+    # Facing a raise: 3-bet premiums, flat strong, set-mine cheap pairs, else fold.
     reraise_thresh = 13 - 2 * late
     call_thresh = 9 - 3 * late
     if chen >= reraise_thresh:
         return _reraise(state, 1.0)
-    if chen >= call_thresh and owed <= 0.12 * (stack + state["your_bet_this_street"]):
+    if chen >= call_thresh and owed <= 0.12 * eff:
+        return {"action": "call"}
+    if is_pair and owed <= 0.06 * eff and eff >= 30 * bb:   # set-mine: cheap + deep
         return {"action": "call"}
     if can_check:
         return {"action": "check"}
@@ -341,17 +371,30 @@ def _postflop(state):
     pot = state["pot"]
     can_check = state["can_check"]
 
-    strong_draw = (street in ("flop", "turn")
+    heads_up = n_opp == 1
+    # Semi-bluffs only make sense heads-up (no fold equity into a crowd).
+    strong_draw = (heads_up and street in ("flop", "turn")
                    and _draw_outs(state["your_cards"], state["community_cards"]) >= 8)
+    # With more opponents someone is likelier to hold a strong hand, so demand
+    # more equity before betting/raising for value.
+    bump = 0.0 if heads_up else 0.05 + 0.03 * (n_opp - 1)
 
     if can_check:
         # No bet to us.
-        if eq >= 0.80:
-            return _bet(state, 0.75)                 # big value
-        if eq >= 0.62:
-            return _bet(state, 0.55)                 # thin value
-        if strong_draw and random.random() < 0.45:
-            return _bet(state, 0.55)                 # semi-bluff with a real draw
+        if eq >= 0.78 + bump:
+            return _bet(state, 0.70)                 # value
+        if eq >= 0.60 + bump:
+            return _bet(state, 0.55)                 # thin value / protection
+        if strong_draw and random.random() < 0.5:
+            return _bet(state, 0.60)                 # semi-bluff (heads-up only)
+        # Balanced bluff (heads-up, turn/river): bet a weak hand sometimes so our
+        # checks aren't a pure tell. Gated by the opponent's fold rate — never
+        # bluff a calling station; bluff foldy / unknown opponents.
+        if heads_up and street in ("turn", "river") and eq < 0.45:
+            ff = _fold_factor(state, _hu_opponent_bot_id(state))
+            freq = 0.20 if ff is None else (min(0.45, ff) if ff > 0.25 else 0.0)
+            if random.random() < freq:
+                return _bet(state, 0.60)
         return {"action": "check"}
 
     # Facing a bet. equity() is measured vs. a RANDOM hand, but a player who
@@ -363,11 +406,11 @@ def _postflop(state):
     #   * largely waived when WE hold a strong draw (drawing equity holds up
     #     even against a strong made-hand range).
     required = owed / (pot + owed) if (pot + owed) > 0 else 1.0
-    if eq >= 0.82:
-        return _reraise(state, 0.9)                  # strong enough to raise for value
+    if eq >= 0.82 + bump:
+        return _reraise(state, 0.9)                  # value raise
 
     if strong_draw and eq >= 0.42 and random.random() < 0.30:
-        return _reraise(state, 0.8)                  # semi-bluff raise
+        return _reraise(state, 0.8)                  # semi-bluff raise (heads-up only)
 
     street_factor = {"flop": 0.16, "turn": 0.24, "river": 0.30}.get(street, 0.24)
     bet_frac = owed / pot if pot > 0 else 1.0        # call size vs. the current pot
@@ -573,8 +616,18 @@ def _blueprint_action(state):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _safe_action(game_state):
+    return {"action": "check"} if game_state.get("can_check") else {"action": "fold"}
+
+
 def decide(game_state: dict) -> dict:
     try:
+        # Defensive: malformed/unknown hole cards would corrupt equity + lookups,
+        # so bail to a safe action rather than act on garbage.
+        cards = game_state.get("your_cards")
+        if (not isinstance(cards, list) or len(cards) != 2
+                or any(c not in CARD_STR for c in cards)):
+            return _safe_action(game_state)
         action = _blueprint_action(game_state)   # heads-up CFR blueprint, if applicable
         if action is not None:
             return action
@@ -582,7 +635,4 @@ def decide(game_state: dict) -> dict:
             return _preflop(game_state)
         return _postflop(game_state)
     except Exception:
-        # Never crash: take a free check if we can, else fold.
-        if game_state.get("can_check"):
-            return {"action": "check"}
-        return {"action": "fold"}
+        return _safe_action(game_state)

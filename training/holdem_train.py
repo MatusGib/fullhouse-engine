@@ -32,7 +32,7 @@ SB, BB, STACK = 50, 100, 10_000
 RAISE_CAP = 4                       # max aggressive actions per street
 BUCKET_ITERS = 40                   # MC rollouts for bucketing during training
 BLUEPRINT_PATH = os.path.join(A.DATA_DIR, "blueprint.npz")
-MAX_ACTIONS = 4
+MAX_ACTIONS = 4        # max legal actions at a node: x,h,b,a (no-bet) / f,c,r,a
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +266,7 @@ def _buckets(holes, board, centroids, rng):
 # Train + export
 # ---------------------------------------------------------------------------
 
-def train(iters, centroids, seed=0):
+def train(iters, centroids, seed=0, out_path=BLUEPRINT_PATH):
     rng = random.Random(seed)
     ckpt = max(1, iters // 8)
     for t in range(iters):
@@ -275,9 +275,9 @@ def train(iters, centroids, seed=0):
         for traverser in (0, 1):
             mccfr(new_state(holes, board, buckets), traverser, t + 1)
         if (t + 1) % ckpt == 0:
-            n = export_blueprint(min_visits=20.0)   # checkpoint the blueprint
-            print("  trained %d/%d iters, infosets=%d, exported=%d"
-                  % (t + 1, iters, len(NODES), n))
+            n = export_blueprint(path=out_path, min_visits=20.0)   # checkpoint
+            print("  [seed %d] %d/%d iters, infosets=%d, exported=%d"
+                  % (seed, t + 1, iters, len(NODES), n))
 
 
 def export_blueprint(path=BLUEPRINT_PATH, min_visits=1.0):
@@ -327,12 +327,15 @@ def _print_preflop_open(centroids):
 
 def main():
     iters = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
+    seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    out_path = sys.argv[3] if len(sys.argv) > 3 else BLUEPRINT_PATH
     centroids = A.load_centroids()
-    print("Heads-up NLHE MCCFR — %d iterations" % iters)
-    train(iters, centroids)
-    n = export_blueprint(min_visits=20.0)
-    print("\nexported %d infosets (>=20 visits) -> %s" % (n, os.path.normpath(BLUEPRINT_PATH)))
-    _print_preflop_open(centroids)
+    print("Heads-up NLHE MCCFR — %d iters, seed %d -> %s" % (iters, seed, out_path))
+    train(iters, centroids, seed=seed, out_path=out_path)
+    n = export_blueprint(path=out_path, min_visits=20.0)
+    print("\nexported %d infosets (>=20 visits) -> %s" % (n, os.path.normpath(out_path)))
+    if out_path == BLUEPRINT_PATH:
+        _print_preflop_open(centroids)
 
 
 if __name__ == "__main__":
