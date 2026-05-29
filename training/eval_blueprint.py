@@ -74,6 +74,7 @@ def play(bot_a, bot_b, hands, seed):
 def main():
     hands = int(sys.argv[1]) if len(sys.argv) > 1 else 4000
     blueprint_bot = load_bot("bot_bp", disable_blueprint=False)
+    blueprint_bot.BP_ENABLED = True            # force-on for evaluation
     heuristic_bot = load_bot("bot_heur", disable_blueprint=True)
 
     loaded = blueprint_bot.BLUEPRINT is not None

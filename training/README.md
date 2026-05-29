@@ -60,11 +60,12 @@ Files (run in order, from the repo root in the WSL venv):
      numpy (no pickled model). `python training/holdem_abstraction.py` builds
      `bots/fullhouse_cfr/data/abstraction.npz`.
 2. `holdem_train.py` — **heads-up NLHE game + external-sampling MCCFR** (CFR+
-   regret flooring). Action abstraction: `check / bet-0.75pot / all-in` with no
-   bet, `fold / call / pot-raise / all-in` facing one (raises capped). Exports
-   the average strategy to `bots/fullhouse_cfr/data/blueprint.npz` as
-   pickle-free arrays (`keys`, `codes`, `probs:float16`).
-   `python training/holdem_train.py [iterations]`  (≈230 iters/sec).
+   regret flooring, Linear-CFR averaging). Action abstraction:
+   `check / half-pot / pot / all-in` with no bet, `fold / call / pot-raise /
+   all-in` facing one (raises capped). Exports the average strategy to
+   `bots/fullhouse_cfr/data/blueprint.npz` as pickle-free arrays (`keys`,
+   `codes`, `probs:float16`, `visits:float32`).
+   `python training/holdem_train.py [iterations]`.
 3. **Runtime** (`bots/fullhouse_cfr/bot.py`): loads both `.npz` at the warmup
    call; in heads-up spots it replays the action log into the same abstract
    infoset key (translating real bet sizes to the abstract bet menu), looks up
@@ -85,28 +86,31 @@ Only infosets visited ≥ 20 times are exported (each with its visit count); at
 runtime the bot trusts an infoset only above `BP_MIN_VISITS` and falls back to
 the heuristic otherwise.
 
-### Status of the v1 blueprint (important)
+### Status: blueprint ENABLED (v1.5)
 
 `eval_blueprint.py` plays the blueprint vs. a blueprint-disabled (heuristic-only)
-clone in **mirrored** heads-up matches — each deal is played both ways so card +
-position variance cancels (the identical-bots control reads ~0 bb/100, i.e. the
-harness is unbiased). At 1M iterations the v1 abstraction trains to a clean
-near-Nash but measures **~break-even-to-slightly-worse than the heuristic**
-(≈ −2 to −5 bb/100 at full usage). That's the *abstraction ceiling*, not
-undertraining — the whole abstract tree is only ~14k infosets and is
-well-converged. The heuristic plays full-resolution NLHE (exact equities, draws,
-opponent reads) and exploits the coarse abstraction.
+clone in **mirrored** heads-up matches (each deal played both ways so card +
+position variance cancels). `robustness_eval.py` checks it across opponent styles
+(nit / LAG / station / maniac / random) so we don't overfit to the reference
+bots. The journey:
 
-So the bot ships with **`BP_ENABLED = False`** and plays the stronger heuristic.
-To make the blueprint surpass it and turn it on:
+- **v1** (8 buckets, single 0.75-pot bet, 1M iters): clean near-Nash but
+  **−2.5 bb/100** vs. the heuristic — one bet size let the heuristic exploit it.
+- **v2** (16 buckets + half-pot, 1.5M iters): the 7× bigger tree (104k infosets)
+  was *undertrained* at that budget and did worse (−7.6). Finer abstraction needs
+  far more iterations than a coarse one — convergence beats resolution here.
+- **v1.5 — shipped** (8 buckets + half-pot bet, ~2M iters, Linear CFR): adding
+  the half-pot bet (sizing flexibility + the ability to distinguish small vs.
+  large bets it faces) flipped it to a small **consistent net win, ~+1.5 bb/100**
+  over the heuristic. Robustness holds across every style (worst case +33 bb/100,
+  matching the heuristic), so enabling it costs no exploitation value vs. a weak
+  field while adding GTO robustness vs. strong opponents.
 
-1. **Refine the abstraction** — more postflop buckets (`N_BUCKETS` in
-   `holdem_abstraction.py`) and a finer bet menu (add half-pot / overbet sizes in
-   `holdem_train.py`'s `legal_actions`).
-2. **Retrain** (longer) and re-run `python training/eval_blueprint.py`.
-3. If it shows a **positive** bb/100, set `BP_ENABLED = True` (and tune
-   `BP_MIN_VISITS`) in `bots/fullhouse_cfr/bot.py`, and include
-   `data/abstraction.npz` + `data/blueprint.npz` in the submission zip.
+So the bot ships with **`BP_ENABLED = True`**, `BP_MIN_VISITS = 150`. The margin
+is small (heads-up only, near the harness noise floor) but consistently positive
+and GTO-robust. To push further: more iterations + a finer bet/bucket menu, then
+re-confirm with both `eval_blueprint.py` and `robustness_eval.py`. Set
+`BP_ENABLED = False` to fall back to the pure heuristic at any time.
 
 ## Constraints that shape all of the above
 

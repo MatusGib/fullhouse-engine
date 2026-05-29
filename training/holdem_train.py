@@ -65,9 +65,12 @@ def legal_actions(s):
     if to_call <= 0:
         acts.append(("x", 0))
         if stack > 0:
-            bet = min(max(BB, int(0.75 * pot)), stack)
-            if 0 < bet < stack:
-                acts.append(("b", bet))
+            half = min(max(BB, int(0.5 * pot)), stack)   # 'h' = half-pot bet
+            full = min(max(BB, int(1.0 * pot)), stack)    # 'b' = pot bet
+            if 0 < half < stack:
+                acts.append(("h", half))
+            if half < full < stack:
+                acts.append(("b", full))
             acts.append(("a", stack))
     else:
         acts.append(("f", 0))
@@ -164,13 +167,14 @@ def infoset_key(s):
 # ---------------------------------------------------------------------------
 
 class Node:
-    __slots__ = ("codes", "na", "regret", "strat_sum")
+    __slots__ = ("codes", "na", "regret", "strat_sum", "visits")
 
     def __init__(self, codes):
         self.codes = codes               # legal action codes (deterministic per key)
         self.na = len(codes)
         self.regret = [0.0] * self.na
         self.strat_sum = [0.0] * self.na
+        self.visits = 0.0                # plain visit count (for the runtime gate)
 
     def strategy(self):
         r = [x if x > 0 else 0.0 for x in self.regret]
@@ -197,7 +201,7 @@ def _node(key, codes):
     return nd
 
 
-def mccfr(s, traverser):
+def mccfr(s, traverser, t):
     if s["terminal"]:
         u0 = util_to_p0(s)
         return u0 if traverser == 0 else -u0
@@ -210,7 +214,7 @@ def mccfr(s, traverser):
         util = [0.0] * len(acts)
         node_util = 0.0
         for i, (code, amt) in enumerate(acts):
-            util[i] = mccfr(apply_action(s, code, amt), traverser)
+            util[i] = mccfr(apply_action(s, code, amt), traverser, t)
             node_util += sigma[i] * util[i]
         for i in range(len(acts)):
             node.regret[i] += util[i] - node_util
@@ -218,9 +222,11 @@ def mccfr(s, traverser):
                 node.regret[i] = 0.0          # CFR+ flooring
         return node_util
 
-    # opponent node: accumulate average strategy, sample one action
+    # opponent node: accumulate the average strategy (Linear CFR: weight by t),
+    # bump the plain visit counter, and sample one action.
+    node.visits += 1.0
     for i in range(len(acts)):
-        node.strat_sum[i] += sigma[i]
+        node.strat_sum[i] += t * sigma[i]
     r = random.random()
     cum = 0.0
     chosen = len(acts) - 1
@@ -230,7 +236,7 @@ def mccfr(s, traverser):
             chosen = i
             break
     code, amt = acts[chosen]
-    return mccfr(apply_action(s, code, amt), traverser)
+    return mccfr(apply_action(s, code, amt), traverser, t)
 
 
 # ---------------------------------------------------------------------------
@@ -262,25 +268,27 @@ def _buckets(holes, board, centroids, rng):
 
 def train(iters, centroids, seed=0):
     rng = random.Random(seed)
+    ckpt = max(1, iters // 8)
     for t in range(iters):
         holes, board = _deal(rng)
         buckets = _buckets(holes, board, centroids, rng)
         for traverser in (0, 1):
-            mccfr(new_state(holes, board, buckets), traverser)
-        if (t + 1) % max(1, iters // 10) == 0:
-            print("  trained %d/%d iters, infosets=%d" % (t + 1, iters, len(NODES)))
+            mccfr(new_state(holes, board, buckets), traverser, t + 1)
+        if (t + 1) % ckpt == 0:
+            n = export_blueprint(min_visits=20.0)   # checkpoint the blueprint
+            print("  trained %d/%d iters, infosets=%d, exported=%d"
+                  % (t + 1, iters, len(NODES), n))
 
 
 def export_blueprint(path=BLUEPRINT_PATH, min_visits=1.0):
     keys, codes, probs, visits = [], [], [], []
     for key, node in NODES.items():
-        v = sum(node.strat_sum)
-        if v < min_visits:
+        if node.visits < min_visits:
             continue
         avg = node.average()
         keys.append(key)
         codes.append("".join(node.codes))
-        visits.append(v)
+        visits.append(node.visits)
         row = np.zeros(MAX_ACTIONS, dtype=np.float16)
         for i in range(min(node.na, MAX_ACTIONS)):
             row[i] = avg[i]

@@ -36,7 +36,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "bots", "fullhouse_cfr"
 ABSTRACTION_PATH = os.path.join(DATA_DIR, "abstraction.npz")
 
 STREET_BOARD_LEN = {"flop": 3, "turn": 4, "river": 5}
-N_BUCKETS = 8                      # postflop buckets per street (coarse v1)
+N_BUCKETS = 8                      # postflop buckets/street (v1's proven-convergent count)
 
 
 # ---------------------------------------------------------------------------

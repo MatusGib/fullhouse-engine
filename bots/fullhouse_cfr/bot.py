@@ -1,20 +1,21 @@
 """
-Fullhouse Hackathon bot — strong heuristic core, with a heads-up CFR blueprint
-wired in but currently DISABLED.
+Fullhouse Hackathon bot — heads-up CFR blueprint over a strong heuristic core.
 
-  - HEURISTIC (active): Chen-formula preflop + eval7 Monte-Carlo equity vs. a
-    pot-odds price, a range penalty vs. bets, opponent-aggression reads from the
-    match log, and draw-based semi-bluffing. Beats every reference bot.
-  - CFR BLUEPRINT (BP_ENABLED = False): in true heads-up spots the bot can map
-    the live state into an abstracted infoset and play an MCCFR-trained strategy
-    from data/blueprint.npz (see training/). The v1 abstraction trains to a
-    near-Nash that measured ~break-even vs. the heuristic in mirrored A/B tests,
-    so it ships off; flip BP_ENABLED once a richer abstraction wins in
-    training/eval_blueprint.py.
+  - CFR BLUEPRINT (active in true heads-up spots): maps the live state into an
+    abstracted infoset (8 equity buckets/street + a half-pot/pot/all-in menu) and
+    plays an external-sampling MCCFR strategy from data/blueprint.npz (~2M iters,
+    CFR+ with Linear averaging; see training/). Heads-up is two-player zero-sum,
+    so this approaches Nash. In mirrored A/B it nets ~+1.5 bb/100 over the
+    heuristic and stays robust across opponent styles. Toggle with BP_ENABLED.
+  - HEURISTIC (everything else + fallback): Chen-formula preflop + eval7
+    Monte-Carlo equity vs. a pot-odds price, a range penalty vs. bets,
+    opponent-aggression reads from the match log, and draw-based semi-bluffing.
+    Beats every reference bot and every style archetype (worst case +33 bb/100).
 
-Safety: any missing data or inconsistent lookup falls back to the heuristic, so
-the bot is never worse than the validated baseline. Never crashes (wrapped),
-stays far under the 2s budget, and uses no forbidden imports.
+Safety: the blueprint acts only in true heads-up, deep-enough spots, gated by a
+visit-count trust threshold; any missing data or inconsistent lookup falls back
+to the heuristic, so the bot is never worse than the validated baseline. Never
+crashes (wrapped), stays far under the 2s budget, uses no forbidden imports.
 """
 
 import os
@@ -62,15 +63,19 @@ def _load_blueprint():
 
 
 BLUEPRINT = _load_blueprint()
-# Only trust a blueprint infoset that was visited enough to have converged.
-BP_MIN_VISITS = 50.0
-# Master switch. The v1 abstraction (8 buckets/street + a 3-size bet menu) trains
-# to a near-Nash that measured ~break-even-to-slightly-worse than the heuristic
-# in mirrored heads-up A/B tests (training/eval_blueprint.py) — the abstraction
-# ceiling, not undertraining. So we ship with the blueprint OFF and play the
-# stronger, proven heuristic. Flip to True once a richer abstraction (more
-# buckets, finer bet sizes) beats the heuristic in eval_blueprint.py.
-BP_ENABLED = False
+# Only trust a blueprint infoset that was visited enough to have converged. The
+# broad-use range (50-150) tested best in mirrored A/B; >=1000 is too selective
+# (mixes blueprint-preflop with heuristic-postflop incoherently).
+BP_MIN_VISITS = 150.0
+# Master switch. Blueprint = 8 buckets/street + a {check, half-pot, pot, all-in}
+# / {fold, call, pot-raise, all-in} menu, external-sampling MCCFR (CFR+, Linear),
+# ~2M iters. Adding the half-pot bet over v1 flipped the mirrored heads-up A/B
+# from -2.5 to a small consistent net win (~+1.5 bb/100) vs the heuristic, and
+# robustness_eval.py confirms it stays robust across opponent styles (worst-case
+# +33 bb/100, matching the heuristic). It only acts in true heads-up spots; the
+# heuristic plays everything else and is the fallback. Set False to play pure
+# heuristic.
+BP_ENABLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +448,7 @@ def _bp_reconstruct_key(state):
 
     codes = []
     sc = [SB_CHIPS, BB_CHIPS]       # street contributions, seeded with the blinds
+    pot = SB_CHIPS + BB_CHIPS       # total pot (for opening-bet half/pot sizing)
     acted = [False, False]
     bet_seen = True                 # preflop has the standing big blind
     for a in log:
@@ -460,16 +466,25 @@ def _bp_reconstruct_key(state):
             codes.append("x")
             acted[pl] = True
         elif act == "call":
+            added = max(0, max(sc) - sc[pl])
+            sc[pl] += added
+            pot += added
             codes.append("c")
-            sc[pl] = max(sc)
             acted[pl] = True
         elif act == "raise":
-            codes.append("r" if bet_seen else "b")
+            added = max(0, amt - sc[pl])
+            if bet_seen:                       # a re-raise facing a bet
+                codes.append("r")
+            else:                              # opening bet: half ('h') vs pot ('b')
+                codes.append("h" if (pot > 0 and added <= 0.75 * pot) else "b")
             sc[pl] = amt
+            pot += added
             acted[pl] = bet_seen = True
         elif act == "all_in":
+            tot = amt if amt else max(sc)
+            pot += max(0, tot - sc[pl])
+            sc[pl] = tot
             codes.append("a")
-            sc[pl] = amt if amt else max(sc)
             acted[pl] = bet_seen = True
         else:
             return None
@@ -493,8 +508,10 @@ def _bp_translate(state, code):
         return {"action": "fold"} if not state["can_check"] else {"action": "check"}
     if code == "a":
         return {"action": "all_in"}
+    if code == "h":
+        return _bet(state, 0.5)
     if code == "b":
-        return _bet(state, 0.75)
+        return _bet(state, 1.0)
     if code == "r":
         return _reraise(state, 1.0)
     return None
