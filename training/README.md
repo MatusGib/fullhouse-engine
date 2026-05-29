@@ -112,6 +112,26 @@ and GTO-robust. To push further: more iterations + a finer bet/bucket menu, then
 re-confirm with both `eval_blueprint.py` and `robustness_eval.py`. Set
 `BP_ENABLED = False` to fall back to the pure heuristic at any time.
 
+### Parallel training + the bet-size experiment
+
+`run_parallel.sh` runs N independent workers (distinct seeds) and
+`merge_blueprints.py` combines them visit-weighted — the way to get "more
+simulations" across cores:
+
+```bash
+bash training/run_parallel.sh 1500000 10    # 10 workers x 1.5M = 15M effective sims
+```
+
+Tried next: a richer **6-size bet menu** (added ⅓-pot and 1.5× overbet) trained
+with 15M parallel sims. Result: it **did not beat v1.5**. The extra sizes blew the
+tree up to ~229k infosets, so even 15M sims left it under-converged — the mirrored
+A/B came out noisy and mostly negative across thresholds (only one threshold
+positive, the hallmark of an undertrained model). Reverted to v1.5's 4-action
+menu. Lesson: **convergence beats resolution** at this compute budget; extra bet
+sizes need far more training than a coarser menu. The parallel infra remains (now
+on the v1.5 menu) — the open opportunity is to re-run it on the v1.5 abstraction
+to better-converge that proven model.
+
 ## Constraints that shape all of the above
 
 - `pickle` / `joblib` / `threading` / `importlib` are **banned imports** → the
