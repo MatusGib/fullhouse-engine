@@ -13,3 +13,8 @@ __pycache__/
 
 # Node
 node_modules/
+
+# Generated CFR artifacts — regenerate with training/holdem_*.py. Add with
+# `git add -f` and ship in the submission zip only once a blueprint beats the
+# heuristic (see training/README.md). The bot runs the heuristic without them.
+bots/fullhouse_cfr/data/
