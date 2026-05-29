@@ -67,15 +67,13 @@ BLUEPRINT = _load_blueprint()
 # broad-use range (50-150) tested best in mirrored A/B; >=1000 is too selective
 # (mixes blueprint-preflop with heuristic-postflop incoherently).
 BP_MIN_VISITS = 150.0
-# Master switch. Blueprint = 8 buckets/street + a {check, half-pot, pot, all-in}
-# / {fold, call, pot-raise, all-in} menu, external-sampling MCCFR (CFR+, Linear),
-# ~2M iters. Adding the half-pot bet over v1 flipped the mirrored heads-up A/B
-# from -2.5 to a small consistent net win (~+1.5 bb/100) vs the heuristic, and
-# robustness_eval.py confirms it stays robust across opponent styles (worst-case
-# +33 bb/100, matching the heuristic). It only acts in true heads-up spots; the
-# heuristic plays everything else and is the fallback. Set False to play pure
-# heuristic.
-BP_ENABLED = True
+# Master switch. The CFR blueprint (8 buckets, ~2M iters) plays GTO-ish heads-up.
+# Round-robin vs a field of strong AI-style bots (training/tournament.py) showed
+# it's INCONSISTENT heads-up — great vs a balanced bluffer (+45 bb/100) but
+# crushed by a solid equity bot (-45) — and it risks misplaying 6-max HU
+# endgames. The pure heuristic is stronger and more consistent in the 6-max
+# competition format, so we ship with the blueprint OFF. Flip True to use it.
+BP_ENABLED = False
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +328,8 @@ def _preflop(state):
         return {"action": "all_in"} if chen >= 7 else {"action": "fold"}
 
     if not facing_raise:
-        # Open or take a free look (open wider heads-up / short-handed).
-        open_thresh = 9 - 4 * late - (2 if n_opp <= 1 else 0)
+        # Open or take a free look (open much wider heads-up / short-handed).
+        open_thresh = 9 - 4 * late - (3 if n_opp <= 1 else 0)
         if chen >= open_thresh:
             target = 3 * bb
             if pot > 2 * bb:                # limpers in front -> size up
@@ -344,11 +342,14 @@ def _preflop(state):
         return {"action": "fold"}
 
     # Facing a raise: 3-bet premiums, flat strong, set-mine cheap pairs, else fold.
-    reraise_thresh = 13 - 2 * late
-    call_thresh = 9 - 3 * late
+    # Heads-up: defend MUCH wider — folding too much just donates the blinds.
+    hu = n_opp <= 1
+    reraise_thresh = (10 if hu else 13) - 2 * late
+    call_thresh = (5 - 2 * late) if hu else (9 - 3 * late)
+    call_cap = (0.18 if hu else 0.12) * eff
     if chen >= reraise_thresh:
         return _reraise(state, 1.0)
-    if chen >= call_thresh and owed <= 0.12 * eff:
+    if chen >= call_thresh and owed <= call_cap:
         return {"action": "call"}
     if is_pair and owed <= 0.06 * eff and eff >= 30 * bb:   # set-mine: cheap + deep
         return {"action": "call"}
