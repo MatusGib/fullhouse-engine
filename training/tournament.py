@@ -36,18 +36,68 @@ def load_ours(modname, bp_on):
     return m.decide
 
 
-def _run_hand(eng, seat_to_decide, ids, mlog, hand_num):
+SPOT_LOG = None     # set to a dict by --spots mode; accumulates leak stats
+
+
+def _chips_added(state, action):
+    """Chips our bot voluntarily puts in with this action, from the pre-action
+    state. Used to weight where in the hand we actually committed money."""
+    a = action.get("action")
+    owed = state.get("amount_owed", 0) or 0
+    stack = state.get("your_stack", 0) or 0
+    bts = state.get("your_bet_this_street", 0) or 0
+    if a == "call":
+        return min(owed, stack)
+    if a == "all_in":
+        return stack
+    if a == "raise":
+        amt = action.get("amount") or 0
+        return max(0, min(amt - bts, stack))
+    return 0                                   # check / fold add nothing
+
+
+def _spot_context(state):
+    """A readable 'street position facing' tag for leak attribution."""
+    street = state["street"]
+    n = len(state["players"])
+    me = state["seat_to_act"]
+    sb = None
+    for a in state.get("action_log", []):
+        if a.get("action") == "small_blind":
+            sb = a["seat"]
+    if sb is None:
+        button = None
+    elif n == 2:
+        button = sb                       # heads-up: SB is the button
+    else:
+        button = (sb - 1) % n
+    if street == "preflop":
+        pos = "btn/SB" if me == button else "BB"
+    else:
+        pos = "IP" if me == button else "OOP"
+    facing = "check" if state.get("can_check") else "vsbet"
+    return "%-7s %-6s %-5s" % (street, pos, facing)
+
+
+def _run_hand(eng, seat_to_decide, ids, mlog, hand_num, track_name=None):
     state = eng.start_hand()
     state["match_action_log"] = mlog[-200:]
     steps = 0
+    hand_spots = []     # (tag, chips_added) for our voluntary decisions this hand
     while state.get("type") == "action_request":
         seat = state["seat_to_act"]
+        tracking = (track_name is not None and SPOT_LOG is not None
+                    and ids[seat] == track_name)
+        ctx = _spot_context(state) if tracking else None
         try:
             action = seat_to_decide[seat](state)
             if not isinstance(action, dict) or "action" not in action:
                 action = {"action": "fold"}
         except Exception:
             action = {"action": "fold"}
+        if tracking:
+            tag = ctx + " " + str(action.get("action"))
+            hand_spots.append((tag, _chips_added(state, action)))
         mlog.append({"hand_num": hand_num, "seat": seat, "bot_id": ids[seat],
                      "action": action.get("action"), "amount": action.get("amount")})
         state = eng.apply_action(seat, action)
@@ -56,6 +106,17 @@ def _run_hand(eng, seat_to_decide, ids, mlog, hand_num):
         steps += 1
         if steps > 1000:
             break
+    if track_name is not None and SPOT_LOG is not None and hand_spots:
+        net = state["final_stacks"].get(track_name, STARTING_STACK) - STARTING_STACK
+        # Attribute the hand's net to spots in proportion to chips committed there,
+        # so the result localises to WHERE we put money — not smeared over the
+        # cheap preflop open. Pure check/fold hands (no investment) split evenly.
+        total_inv = sum(c for _, c in hand_spots)
+        for tag, c in hand_spots:
+            w = (c / total_inv) if total_inv > 0 else (1.0 / len(hand_spots))
+            e = SPOT_LOG.setdefault(tag, [0.0, 0])
+            e[0] += net * w
+            e[1] += 1
     return state
 
 
@@ -111,9 +172,57 @@ def play_ring(field, hands, seed):
     return {x: deltas[x] / hands / BB * 100 for x in names}
 
 
+def diagnose(opp_name, hands, seed):
+    """Heads-up vs one opponent with per-spot chip attribution. Prints the
+    spots where our bot bleeds the most (most-negative net first).
+
+    Each hand's net chip result is split across the spots we acted in IN
+    PROPORTION to the chips we committed there, so a row's tot_chips is the share
+    of our win/loss attributable to that spot. This localises leaks to where money
+    actually went (a cheap preflop open barely registers; a big river call carries
+    its full weight). Rows now sum to ~the overall total. 'n' is how many times we
+    were in that spot. NOTE: chip-flow can't see opportunity cost — over-folding a
+    cheap spot looks fine here because folding only forfeits chips already in.
+    """
+    global SPOT_LOG
+    ours = load_ours("ours_diag_%s" % opp_name, False)
+    opp = C.BOTS[opp_name]
+    SPOT_LOG = {}
+    mlog = []
+    net_total = 0
+    for h in range(hands):
+        for a_btn in (True, False):
+            ids = ["ours", opp_name] if a_btn else [opp_name, "ours"]
+            decide = {0: ours, 1: opp} if a_btn else {0: opp, 1: ours}
+            eng = PokerEngine("g", ids, dealer_seat=0, seed=seed + h)
+            st = _run_hand(eng, decide, ids, mlog, h, track_name="ours")
+            net_total += st["final_stacks"]["ours"] - STARTING_STACK
+    overall = net_total / (2 * hands) / BB * 100
+    print("\n=== leak diagnosis: ours vs %s  (%d mirrored hands, overall %+.2f bb/100) ==="
+          % (opp_name, hands, overall))
+    print("  %-27s %5s %10s %9s" % ("street  pos    facing action", "n", "tot_chips", "bb/100"))
+    rows = sorted(SPOT_LOG.items(), key=lambda kv: kv[1][0])   # most negative first
+    for tag, (tot, n) in rows:
+        bb100 = tot / n / BB * 100 if n else 0
+        print("  %-27s %5d %10d %+9.2f" % (tag, n, int(round(tot)), bb100))
+    SPOT_LOG = None
+
+
 def main():
-    hu_hands = int(sys.argv[1]) if len(sys.argv) > 1 else 500
-    sixmax_matches = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+    raw = sys.argv[1:]
+    spots = "--spots" in raw
+    raw = [a for a in raw if a != "--spots"]
+    hu_hands = int(raw[0]) if len(raw) > 0 else 500
+    sixmax_matches = int(raw[1]) if len(raw) > 1 else 6
+
+    if spots:
+        # Focused leak hunt vs the elite bots we lose to. Reproducible RNG so the
+        # numbers are stable across runs (judge by rank, not the noise floor).
+        random.seed(424242)
+        for opp in ("eqpro", "adapt", "tag"):
+            diagnose(opp, hu_hands, seed=1000)
+        return
+
     random.seed(424242)        # reproducible: bots' MC/bluff RNG fixed across runs
     field = {"ours": load_ours("ours_off", False), **C.BOTS}
     names = list(field)

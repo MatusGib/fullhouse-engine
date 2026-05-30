@@ -309,6 +309,23 @@ def _draw_outs(hole_strs, board_strs):
 # Preflop decision
 # ---------------------------------------------------------------------------
 
+def _preflop_raise_call_counts(state):
+    """Count raises and post-raise cold-calls in the preflop action log.
+    A squeeze spot = exactly one raise (the open) with >=1 caller behind it."""
+    raises = calls = 0
+    seen_raise = False
+    for a in state.get("action_log", []):
+        act = a.get("action")
+        if act in ("small_blind", "big_blind"):
+            continue
+        if act in ("raise", "all_in"):
+            raises += 1
+            seen_raise = True
+        elif act == "call" and seen_raise:
+            calls += 1
+    return raises, calls
+
+
 def _preflop(state):
     bb = _big_blind(state)
     cards = state["your_cards"]
@@ -347,6 +364,25 @@ def _preflop(state):
     reraise_thresh = (10 if hu else 13) - 2 * late
     call_thresh = (5 - 2 * late) if hu else (9 - 3 * late)
     call_cap = (0.18 if hu else 0.12) * eff
+
+    # Squeeze: a single open + >=1 cold-caller, folded to us (multiway only).
+    # The caller's range is capped (it would have 3-bet its premiums) and the
+    # extra dead chips improve our price, so we 3-bet a merged range — value a
+    # bit wider than a normal multiway 3-bet, plus a capped-frequency pressure
+    # 3-bet with hands that block/play. Targeted +EV spot, not a blanket
+    # loosening (past testing showed loosening calls/values backfires).
+    if not hu and eff >= 20 * bb:
+        raises_pf, callers_pf = _preflop_raise_call_counts(state)
+        if raises_pf == 1 and callers_pf >= 1 and owed <= 0.15 * eff:
+            suited = cards[0][1] == cards[1][1]
+            has_ace = "A" in (cards[0][0], cards[1][0])
+            size = 1.2 + 0.25 * callers_pf       # bigger vs more cold-callers
+            if chen >= 10:
+                return _reraise(state, size)                   # value squeeze
+            if (chen >= 8 and (suited or is_pair or has_ace)
+                    and random.random() < 0.20):
+                return _reraise(state, size)                   # pressure squeeze (capped)
+
     if chen >= reraise_thresh:
         return _reraise(state, 1.0)
     if chen >= call_thresh and owed <= call_cap:
@@ -373,6 +409,7 @@ def _postflop(state):
     can_check = state["can_check"]
 
     heads_up = n_opp == 1
+    late = _lateness(state)        # 0 = out of position (acts first), 1 = button
     # Semi-bluffs only make sense heads-up (no fold equity into a crowd).
     strong_draw = (heads_up and street in ("flop", "turn")
                    and _draw_outs(state["your_cards"], state["community_cards"]) >= 8)
@@ -415,8 +452,15 @@ def _postflop(state):
 
     street_factor = {"flop": 0.16, "turn": 0.24, "river": 0.30}.get(street, 0.24)
     bet_frac = owed / pot if pot > 0 else 1.0        # call size vs. the current pot
-    range_penalty = street_factor * min(bet_frac / 0.6, 1.2)
+    size_term = min(bet_frac / 0.6, 1.2)
+    if street in ("turn", "river"):
+        size_term = max(0.5, size_term)   # tiny late-street bets still imply strength
+    range_penalty = street_factor * size_term
     range_penalty *= _penalty_multiplier(state)
+    if late < 0.45:               # out of position: fold more facing bets (top leak)
+        range_penalty *= 1.4
+    elif street in ("turn", "river"):   # in position, late streets were over-called too
+        range_penalty *= 1.2
     if strong_draw:
         range_penalty *= 0.25
     bar = required + 0.03 + range_penalty
